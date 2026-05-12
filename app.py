@@ -628,4 +628,103 @@ def main():
                 if freq_minutes == 15:
                     data_source_info = f"Dữ liệu gốc 15 phút, giữ nguyên tần suất gốc"
                 elif freq_minutes > 15:
-                    data_source_info = f"Dữ liệu gốc
+                    data_source_info = f"Dữ liệu gốc 15 phút, đã tổng hợp lên {freq_minutes} phút (lấy trung bình)"
+                else:
+                    data_source_info = f"Dữ liệu gốc 15 phút, đã nội suy xuống {freq_minutes} phút"
+            else:
+                if freq_minutes == 60:
+                    data_source_info = f"Dữ liệu gốc 1 giờ (do chọn {days} ngày > 7 ngày), giữ nguyên tần suất"
+                else:
+                    data_source_info = f"Dữ liệu gốc 1 giờ (do chọn {days} ngày > 7 ngày), đã nội suy xuống {freq_minutes} phút bằng phương pháp Cubic Spline"
+            
+            # Bước 3: Tạo file Excel
+            excel_file = create_excel_file(
+                timestamps, wind_speed, wind_gust, wind_avg, temperature, 
+                lat, lon, freq_minutes, actual_height, data_source_info
+            )
+            
+            if excel_file is None:
+                st.error("Không thể tạo file Excel")
+                return
+            
+            # Hiển thị thông báo thành công
+            freq_display = f"{freq_minutes} phút" if freq_minutes < 60 else "1 giờ"
+            st.success(f"✅ Thành công! Đã lấy {len(timestamps)} mốc dữ liệu (tần suất: {freq_display})")
+            
+            # Bước 4: Tạo DataFrame để hiển thị
+            df_display = pd.DataFrame({
+                'Thời gian': [dt.strftime('%Y-%m-%d %H:%M') for dt in datetime_resampled],
+                'Gió giật (m/s)': [f"{g:.1f}" if g is not None and not np.isnan(g) else '' for g in wind_gust],
+                'Gió thường (m/s)': [f"{s:.1f}" if s is not None and not np.isnan(s) else '' for s in wind_speed],
+                'Gió TB (m/s)': [f"{a:.1f}" if a is not None and not np.isnan(a) else '' for a in wind_avg],
+                'Nhiệt độ (°C)': [f"{t:.1f}" if t is not None and not np.isnan(t) else '' for t in temperature]
+            })
+            
+            # Bước 5: Hiển thị thống kê nhanh
+            st.subheader("📊 Thống kê nhanh")
+            stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+            
+            valid_speed = [s for s in wind_speed if s is not None and not np.isnan(s)]
+            valid_gust = [g for g in wind_gust if g is not None and not np.isnan(g)]
+            valid_avg = [a for a in wind_avg if a is not None and not np.isnan(a)]
+            valid_temp = [t for t in temperature if t is not None and not np.isnan(t)]
+            
+            with stat_col1:
+                avg_speed = sum(valid_speed)/len(valid_speed) if valid_speed else 0
+                st.metric("🌬️ Gió thường TB", f"{avg_speed:.1f} m/s")
+                st.caption(f"Max: {max(valid_speed):.1f} m/s" if valid_speed else "")
+            
+            with stat_col2:
+                avg_gust = sum(valid_gust)/len(valid_gust) if valid_gust else 0
+                st.metric("💨 Gió giật TB", f"{avg_gust:.1f} m/s")
+                st.caption(f"Max: {max(valid_gust):.1f} m/s" if valid_gust else "")
+            
+            with stat_col3:
+                avg_avg = sum(valid_avg)/len(valid_avg) if valid_avg else 0
+                st.metric("📊 Gió TB", f"{avg_avg:.1f} m/s")
+            
+            with stat_col4:
+                avg_temp = sum(valid_temp)/len(valid_temp) if valid_temp else 0
+                st.metric("🌡️ Nhiệt độ TB", f"{avg_temp:.1f} °C")
+                st.caption(f"Max: {max(valid_temp):.1f}°C / Min: {min(valid_temp):.1f}°C" if valid_temp else "")
+            
+            # Bước 6: Vẽ biểu đồ
+            st.subheader("📈 Biểu đồ dự báo")
+            fig = create_chart(df_display, days, freq_minutes, actual_height)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Bước 7: Hiển thị bảng dữ liệu
+            with st.expander("📊 Xem dữ liệu chi tiết", expanded=False):
+                freq_display_text = f"{freq_minutes} phút" if freq_minutes < 60 else "1 giờ"
+                st.info(f"📊 Tổng số dòng: {len(df_display)} dòng dữ liệu (tần suất: {freq_display_text})")
+                st.dataframe(df_display, use_container_width=True, height=400)
+            
+            # Bước 8: Nút tải file
+            st.markdown("---")
+            filename = f"BT1_wind_data_{lat}_{lon}_{wind_height}m_{freq_minutes}min_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                st.download_button(
+                    label="📥 Tải file Excel (đầy đủ 3 sheet)",
+                    data=excel_file,
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            
+            # Hiển thị thông tin file
+            st.caption(f"📁 Tên file: {filename}")
+            st.caption(f"📊 Dung lượng: {len(excel_file.getvalue()) / 1024:.1f} KB")
+            
+        except Exception as e:
+            st.error(f"❌ Lỗi: {str(e)}")
+            st.info("Vui lòng kiểm tra lại tọa độ và kết nối internet.")
+
+
+# ============================================================
+# CHẠY ỨNG DỤNG
+# ============================================================
+if __name__ == "__main__":
+    main()
