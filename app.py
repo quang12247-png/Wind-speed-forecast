@@ -528,9 +528,9 @@ def main():
         
         # Tùy chọn độ phân giải - HIỂN THỊ ĐẦY ĐỦ CHO MỌI TRƯỜNG HỢP
         freq_options = {
-            "15 phút (nội suy nếu cần)": 15,
-            "30 phút (nội suy nếu cần)": 30,
-            "1 giờ (tổng hợp nếu cần)": 60
+            "15 phút": 15,
+            "30 phút": 30,
+            "1 giờ": 60
         }
         
         if days <= 7:
