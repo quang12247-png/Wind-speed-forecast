@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.interpolate import interp1d
 
 # CẤU HÌNH TRANG
 st.set_page_config(
@@ -62,7 +63,7 @@ def get_wind_data_openmeteo(lat, lon, days=5, wind_height=10):
     else:
         # Dùng hourly cho dữ liệu dài hơn (tối đa 16 ngày)
         time_resolution = "hourly"
-        freq_text = "1 giờ (bắt buộc)"
+        freq_text = "1 giờ (gốc)"
         params = {
             "latitude": lat,
             "longitude": lon,
@@ -121,11 +122,78 @@ def get_wind_data_openmeteo(lat, lon, days=5, wind_height=10):
 
 
 # ============================================================
-# HÀM TỔNG HỢP DỮ LIỆU (RESAMPLE)
+# HÀM NỘI SUY DỮ LIỆU (CHO TRƯỜNG HỢP >7 NGÀY)
+# ============================================================
+def interpolate_data(timestamps, wind_speed, wind_gust, temperature, datetime_objects, original_freq, target_freq_minutes):
+    """
+    Nội suy dữ liệu từ tần suất thô (1 giờ) xuống tần suất mịn hơn (30 phút hoặc 15 phút)
+    Sử dụng phương pháp nội suy bậc 3 (cubic) cho dữ liệu liên tục
+    """
+    from scipy.interpolate import interp1d
+    
+    # Chuyển đổi dữ liệu thành mảng numpy
+    timestamps_seconds = np.array([ts / 1000 for ts in timestamps])  # Chuyển về giây
+    wind_speed_array = np.array(wind_speed)
+    wind_gust_array = np.array(wind_gust)
+    temperature_array = np.array(temperature)
+    
+    # Tạo timestamp mới với tần suất mong muốn
+    start_time = timestamps_seconds[0]
+    end_time = timestamps_seconds[-1]
+    
+    # Tính khoảng thời gian giữa các điểm nội suy (phút -> giây)
+    interval_seconds = target_freq_minutes * 60
+    
+    # Tạo mảng thời gian mới
+    new_timestamps_seconds = np.arange(start_time, end_time + interval_seconds, interval_seconds)
+    new_datetime_objects = [datetime.fromtimestamp(ts) for ts in new_timestamps_seconds]
+    new_timestamps_ms = [int(ts * 1000) for ts in new_timestamps_seconds]
+    
+    # Loại bỏ các giá trị NaN
+    valid_idx = ~(np.isnan(wind_speed_array) | np.isnan(wind_gust_array) | np.isnan(temperature_array))
+    
+    if np.sum(valid_idx) < 2:
+        st.error("Không đủ dữ liệu hợp lệ để nội suy")
+        return None, None, None, None, None, None
+    
+    timestamps_valid = timestamps_seconds[valid_idx]
+    wind_speed_valid = wind_speed_array[valid_idx]
+    wind_gust_valid = wind_gust_array[valid_idx]
+    temperature_valid = temperature_array[valid_idx]
+    
+    try:
+        # Nội suy tốc độ gió thường (cubic spline)
+        f_speed = interp1d(timestamps_valid, wind_speed_valid, kind='cubic', fill_value='extrapolate')
+        new_wind_speed = f_speed(new_timestamps_seconds)
+        
+        # Nội suy gió giật (cubic spline)
+        f_gust = interp1d(timestamps_valid, wind_gust_valid, kind='cubic', fill_value='extrapolate')
+        new_wind_gust = f_gust(new_timestamps_seconds)
+        
+        # Nội suy nhiệt độ (linear cho ổn định hơn)
+        f_temp = interp1d(timestamps_valid, temperature_valid, kind='linear', fill_value='extrapolate')
+        new_temperature = f_temp(new_timestamps_seconds)
+        
+        # Đảm bảo không có giá trị âm cho tốc độ gió
+        new_wind_speed = np.maximum(new_wind_speed, 0)
+        new_wind_gust = np.maximum(new_wind_gust, 0)
+        
+        st.info(f"📊 Đã nội suy: {len(new_timestamps_ms)} mốc ({target_freq_minutes} phút/lần) từ {len(timestamps)} mốc gốc (1 giờ)")
+        st.success(f"✨ Phương pháp nội suy: Bậc 3 (cubic) cho gió, Tuyến tính (linear) cho nhiệt độ")
+        
+        return new_timestamps_ms, new_wind_speed.tolist(), new_wind_gust.tolist(), new_temperature.tolist(), new_datetime_objects
+        
+    except Exception as e:
+        st.error(f"Lỗi khi nội suy dữ liệu: {str(e)}")
+        return None, None, None, None, None, None
+
+
+# ============================================================
+# HÀM TỔNG HỢP DỮ LIỆU (RESAMPLE VÀ NỘI SUY)
 # ============================================================
 def resample_data(timestamps, wind_speed, wind_gust, temperature, datetime_objects, original_freq, target_freq_minutes):
     """
-    Tổng hợp dữ liệu từ tần suất gốc lên tần suất mong muốn
+    Tổng hợp hoặc nội suy dữ liệu từ tần suất gốc lên/xuống tần suất mong muốn
     original_freq: 15 hoặc 60 (phút)
     target_freq_minutes: 15, 30, 60
     """
@@ -135,7 +203,7 @@ def resample_data(timestamps, wind_speed, wind_gust, temperature, datetime_objec
         st.error("Không có dữ liệu datetime để xử lý")
         return None, None, None, None, None, None
     
-    # Nếu không cần resample (giữ nguyên)
+    # Trường hợp 1: Giữ nguyên tần suất gốc
     if original_freq == target_freq_minutes:
         st.info(f"📊 Giữ nguyên dữ liệu gốc: {len(timestamps)} mốc ({original_freq} phút/lần)")
         
@@ -149,21 +217,8 @@ def resample_data(timestamps, wind_speed, wind_gust, temperature, datetime_objec
         
         return timestamps, wind_speed, wind_gust, wind_avg, temperature, datetime_objects
     
-    # Nếu target_freq < original_freq (không thể resample lên tần suất cao hơn)
-    if target_freq_minutes < original_freq:
-        st.warning(f"⚠️ Không thể tổng hợp từ {original_freq} phút xuống {target_freq_minutes} phút. Giữ nguyên dữ liệu gốc {original_freq} phút.")
-        
-        wind_avg = []
-        for speed, gust in zip(wind_speed, wind_gust):
-            if speed is not None and gust is not None and not np.isnan(speed) and not np.isnan(gust):
-                wind_avg.append((speed + gust) / 2)
-            else:
-                wind_avg.append(None)
-        
-        return timestamps, wind_speed, wind_gust, wind_avg, temperature, datetime_objects
-    
-    # Tổng hợp dữ liệu
-    try:
+    # Trường hợp 2: Dữ liệu gốc tần suất cao hơn target (resample xuống)
+    elif original_freq < target_freq_minutes:
         # Chuyển dữ liệu thành DataFrame
         df_orig = pd.DataFrame({
             'datetime': datetime_objects,
@@ -222,16 +277,38 @@ def resample_data(timestamps, wind_speed, wind_gust, temperature, datetime_objec
         st.info(f"📊 Đã tổng hợp: {len(timestamps_res)} mốc ({target_freq_minutes} phút/lần) từ {len(timestamps)} mốc gốc ({original_freq} phút)")
         
         return timestamps_res, wind_speed_res, wind_gust_res, wind_avg_res, temp_res, datetime_res
+    
+    # Trường hợp 3: Dữ liệu gốc tần suất thấp hơn target (nội suy lên)
+    else:  # original_freq > target_freq_minutes
+        st.info(f"🔄 Đang nội suy dữ liệu từ {original_freq} phút xuống {target_freq_minutes} phút...")
         
-    except Exception as e:
-        st.error(f"Lỗi khi resample dữ liệu: {str(e)}")
-        wind_avg = []
-        for speed, gust in zip(wind_speed, wind_gust):
+        # Sử dụng hàm nội suy
+        result = interpolate_data(timestamps, wind_speed, wind_gust, temperature, 
+                                 datetime_objects, original_freq, target_freq_minutes)
+        
+        if result[0] is None:
+            st.warning(f"⚠️ Không thể nội suy dữ liệu. Sử dụng phương pháp thay thế (linear với dữ liệu gốc).")
+            # Fallback: sử dụng phương pháp đơn giản hơn
+            timestamps_res, wind_speed_res, wind_gust_res, temp_res, datetime_res = result
+            if timestamps_res is None:
+                # Giữ nguyên dữ liệu gốc nếu không thể nội suy
+                wind_avg = []
+                for speed, gust in zip(wind_speed, wind_gust):
+                    if speed is not None and gust is not None and not np.isnan(speed) and not np.isnan(gust):
+                        wind_avg.append((speed + gust) / 2)
+                    else:
+                        wind_avg.append(None)
+                return timestamps, wind_speed, wind_gust, wind_avg, temperature, datetime_objects
+        
+        # Tính gió trung bình sau nội suy
+        wind_avg_res = []
+        for speed, gust in zip(result[1], result[2]):
             if speed is not None and gust is not None and not np.isnan(speed) and not np.isnan(gust):
-                wind_avg.append((speed + gust) / 2)
+                wind_avg_res.append((speed + gust) / 2)
             else:
-                wind_avg.append(None)
-        return timestamps, wind_speed, wind_gust, wind_avg, temperature, datetime_objects
+                wind_avg_res.append(None)
+        
+        return result[0], result[1], result[2], wind_avg_res, result[3], result[4]
 
 
 # ============================================================
@@ -430,7 +507,7 @@ def main():
         
         st.subheader("⚙️ Tùy chọn")
         days = st.slider("📅 Số ngày dự báo", 1, 15, 5, 
-                        help="1-7 ngày: dữ liệu 15 phút gốc | 8-15 ngày: dữ liệu 1 giờ gốc")
+                        help="1-7 ngày: dữ liệu 15 phút gốc | 8-15 ngày: dữ liệu 1 giờ gốc (hỗ trợ nội suy xuống 30 phút hoặc 15 phút)")
         
         # Tùy chọn độ cao gió THƯỜNG
         height_options = {
@@ -449,25 +526,36 @@ def main():
         
         st.caption("⚠️ **Lưu ý:** Gió giật (gust) chỉ được API hỗ trợ ở độ cao 10m")
         
-        # Tùy chọn độ phân giải - Chỉ hiển thị đầy đủ khi days <= 7
+        # Tùy chọn độ phân giải - HIỂN THỊ ĐẦY ĐỦ CHO MỌI TRƯỜNG HỢP
+        freq_options = {
+            "15 phút (nội suy nếu cần)": 15,
+            "30 phút (nội suy nếu cần)": 30,
+            "1 giờ (tổng hợp nếu cần)": 60
+        }
+        
         if days <= 7:
-            freq_options = {
-                "15 phút (chi tiết nhất)": 15,
-                "30 phút": 30,
-                "1 giờ (tổng hợp)": 60
-            }
             freq_choice = st.selectbox(
                 "⏱️ Độ phân giải dữ liệu",
                 options=list(freq_options.keys()),
                 index=0,
-                help="Dữ liệu gốc 15 phút, có thể tổng hợp lên 30 phút hoặc 1 giờ"
+                help="Dữ liệu gốc 15 phút, có thể tổng hợp lên hoặc nội suy xuống"
             )
-            freq_minutes = freq_options[freq_choice]
         else:
-            # Nếu days > 7, bắt buộc dùng 1 giờ và vô hiệu hóa lựa chọn
-            freq_minutes = 60
-            st.info("📌 **Độ phân giải cố định: 1 giờ** (do số ngày dự báo > 7)")
-            st.caption("Khi chọn trên 7 ngày, API chỉ hỗ trợ dữ liệu 1 giờ")
+            freq_choice = st.selectbox(
+                "⏱️ Độ phân giải dữ liệu",
+                options=list(freq_options.keys()),
+                index=1,
+                help="Dữ liệu gốc 1 giờ, có thể nội suy xuống 30 phút hoặc 15 phút (dùng Cubic Spline)"
+            )
+        
+        freq_minutes = freq_options[freq_choice]
+        
+        # Hiển thị phương pháp xử lý
+        if days > 7 and freq_minutes < 60:
+            st.success("✨ **Sẽ sử dụng nội suy Cubic Spline** để tạo dữ liệu chi tiết từ dữ liệu 1 giờ")
+            st.caption("📐 Phương pháp: Nội suy bậc 3 (cubic) cho gió, tuyến tính cho nhiệt độ")
+        elif days <= 7 and freq_minutes > 15:
+            st.info("📊 Sẽ tổng hợp dữ liệu từ 15 phút lên tần suất cao hơn")
         
         st.markdown("---")
         download_btn = st.button("🚀 TẢI DỮ LIỆU", type="primary", use_container_width=True)
@@ -480,9 +568,10 @@ def main():
         st.caption("✅ **Nhiệt độ:** 2m")
         if days <= 7:
             st.caption("✅ **Dữ liệu gốc:** 15 phút/lần")
-            st.caption("✅ **Tổng hợp linh hoạt:** 15 phút, 30 phút, 1 giờ")
+            st.caption("✅ **Xử lý:** Tổng hợp hoặc nội suy linh hoạt")
         else:
-            st.caption("✅ **Dữ liệu gốc:** 1 giờ/lần (bắt buộc)")
+            st.caption("✅ **Dữ liệu gốc:** 1 giờ/lần")
+            st.caption("✅ **Xử lý:** Nội suy Cubic Spline xuống 30/15 phút")
         st.caption("✅ **Định dạng số:** 1 chữ số thập phân")
         
         st.markdown("---")
@@ -516,121 +605,27 @@ def main():
             
             timestamps_orig, wind_speed_orig, wind_gust_orig, temp_orig, datetime_orig, actual_height, original_freq, freq_text = result
             
-            # Bước 2: Resample dữ liệu theo tần suất đã chọn
+            # Bước 2: Resample hoặc nội suy dữ liệu theo tần suất đã chọn
             result_resample = resample_data(
                 timestamps_orig, wind_speed_orig, wind_gust_orig, temp_orig, 
                 datetime_orig, original_freq, freq_minutes
             )
             
-            # Kiểm tra kết quả resample
+            # Kiểm tra kết quả
             if result_resample[0] is None:
                 st.error("Không thể xử lý dữ liệu. Vui lòng thử lại với độ phân giải khác.")
                 return
             
             timestamps, wind_speed, wind_gust, wind_avg, temperature, datetime_resampled = result_resample
             
-            # Kiểm tra dữ liệu sau resample
+            # Kiểm tra dữ liệu sau xử lý
             if not timestamps or len(timestamps) == 0:
-                st.warning("Không có dữ liệu sau khi tổng hợp. Vui lòng thử với độ phân giải khác.")
+                st.warning("Không có dữ liệu sau khi xử lý. Vui lòng thử với độ phân giải khác.")
                 return
             
             # Tạo thông tin ghi chú cho file Excel
             if days <= 7:
-                data_source_info = f"Dữ liệu gốc 15 phút, đã tổng hợp lên {freq_minutes} phút theo yêu cầu"
-            else:
-                data_source_info = f"Dữ liệu gốc 1 giờ (do chọn {days} ngày > 7 ngày)"
-            
-            # Bước 3: Tạo file Excel
-            excel_file = create_excel_file(
-                timestamps, wind_speed, wind_gust, wind_avg, temperature, 
-                lat, lon, freq_minutes, actual_height, data_source_info
-            )
-            
-            if excel_file is None:
-                st.error("Không thể tạo file Excel")
-                return
-            
-            # Hiển thị thông báo thành công
-            if days <= 7:
-                freq_display = f"{freq_minutes} phút" if freq_minutes < 60 else "1 giờ"
-                st.success(f"✅ Thành công! Đã lấy {len(timestamps)} mốc dữ liệu (tần suất: {freq_display})")
-            else:
-                st.success(f"✅ Thành công! Đã lấy {len(timestamps)} mốc dữ liệu (tần suất: 1 giờ - bắt buộc do chọn {days} ngày)")
-            
-            # Bước 4: Tạo DataFrame để hiển thị
-            df_display = pd.DataFrame({
-                'Thời gian': [dt.strftime('%Y-%m-%d %H:%M') for dt in datetime_resampled],
-                'Gió giật (m/s)': [f"{g:.1f}" if g is not None and not np.isnan(g) else '' for g in wind_gust],
-                'Gió thường (m/s)': [f"{s:.1f}" if s is not None and not np.isnan(s) else '' for s in wind_speed],
-                'Gió TB (m/s)': [f"{a:.1f}" if a is not None and not np.isnan(a) else '' for a in wind_avg],
-                'Nhiệt độ (°C)': [f"{t:.1f}" if t is not None and not np.isnan(t) else '' for t in temperature]
-            })
-            
-            # Bước 5: Hiển thị thống kê nhanh
-            st.subheader("📊 Thống kê nhanh")
-            stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-            
-            valid_speed = [s for s in wind_speed if s is not None and not np.isnan(s)]
-            valid_gust = [g for g in wind_gust if g is not None and not np.isnan(g)]
-            valid_avg = [a for a in wind_avg if a is not None and not np.isnan(a)]
-            valid_temp = [t for t in temperature if t is not None and not np.isnan(t)]
-            
-            with stat_col1:
-                avg_speed = sum(valid_speed)/len(valid_speed) if valid_speed else 0
-                st.metric("🌬️ Gió thường", f"{avg_speed:.1f} m/s")
-                st.caption(f"Max: {max(valid_speed):.1f} m/s" if valid_speed else "")
-            
-            with stat_col2:
-                avg_gust = sum(valid_gust)/len(valid_gust) if valid_gust else 0
-                st.metric("💨 Gió giật", f"{avg_gust:.1f} m/s")
-                st.caption(f"Max: {max(valid_gust):.1f} m/s" if valid_gust else "")
-            
-            with stat_col3:
-                avg_avg = sum(valid_avg)/len(valid_avg) if valid_avg else 0
-                st.metric("📊 Tốc độ gió trung bình", f"{avg_avg:.1f} m/s")
-            
-            with stat_col4:
-                avg_temp = sum(valid_temp)/len(valid_temp) if valid_temp else 0
-                st.metric("🌡️ Nhiệt độ TB", f"{avg_temp:.1f} °C")
-                st.caption(f"Max: {max(valid_temp):.1f}°C / Min: {min(valid_temp):.1f}°C" if valid_temp else "")
-            
-            # Bước 6: Vẽ biểu đồ
-            st.subheader("📈 Biểu đồ dự báo")
-            fig = create_chart(df_display, days, freq_minutes, actual_height)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Bước 7: Hiển thị bảng dữ liệu
-            with st.expander("📊 Xem dữ liệu chi tiết", expanded=False):
-                freq_display_text = f"{freq_minutes} phút" if freq_minutes < 60 else "1 giờ"
-                st.info(f"📊 Tổng số dòng: {len(df_display)} dòng dữ liệu (tần suất: {freq_display_text})")
-                st.dataframe(df_display, use_container_width=True, height=400)
-            
-            # Bước 8: Nút tải file
-            st.markdown("---")
-            filename = f"BT1_wind_data_{lat}_{lon}_{wind_height}m_{freq_minutes}min_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                st.download_button(
-                    label="📥 Tải file Excel (đầy đủ 3 sheet)",
-                    data=excel_file,
-                    file_name=filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-            
-            # Hiển thị thông tin file
-            st.caption(f"📁 Tên file: {filename}")
-            st.caption(f"📊 Dung lượng: {len(excel_file.getvalue()) / 1024:.1f} KB")
-            
-        except Exception as e:
-            st.error(f"❌ Lỗi: {str(e)}")
-            st.info("Vui lòng kiểm tra lại tọa độ và kết nối internet.")
-
-
-# ============================================================
-# CHẠY ỨNG DỤNG
-# ============================================================
-if __name__ == "__main__":
-    main()
+                if freq_minutes == 15:
+                    data_source_info = f"Dữ liệu gốc 15 phút, giữ nguyên tần suất gốc"
+                elif freq_minutes > 15:
+                    data_source_info = f"Dữ liệu gốc
